@@ -275,6 +275,11 @@ class TranslationTask(LegacyFairseqTask):
                                    tgt_dict=self.target_dictionary,
                                    constraints=constraints)
 
+    def build_dataset_for_attention(self, src_tokens, src_lengths, tgt_tokens, tgt_lengths, constraints=None):
+        return LanguagePairDataset(src_tokens, src_lengths, self.source_dictionary,
+                                   tgt_tokens, tgt_lengths, self.target_dictionary,
+                                   constraints=constraints)
+
     def build_model(self, args):
         model = super().build_model(args)
         if getattr(args, 'eval_bleu', False):

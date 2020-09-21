@@ -725,6 +725,44 @@ class SequenceGenerator(nn.Module):
             ] = torch.tensor(-math.inf).to(lprobs)
         return lprobs
 
+    @torch.no_grad()
+    def generate_attention(self, models, sample, **kwargs):
+        attns = []
+        for model in self.model.models:
+            decoder_out = model(**sample['net_input'])
+            if isinstance(decoder_out[1], Tensor):
+                attn = decoder_out[1]
+            else:
+                attn_holder = decoder_out[1]["attn"]
+                if isinstance(attn_holder, Tensor):
+                    attn = attn_holder
+                elif attn_holder is not None:
+                    attn = attn_holder[0]
+            attns.append(attn)
+        attns = torch.stack(attns, dim=0).mean(dim=0).transpose(1, 2)
+
+        src_tokens = sample['net_input']['src_tokens']
+        bsz = src_tokens.shape[0]
+        tgt_tokens = sample['target']
+        if src_tokens.device != "cpu":
+            src_tokens = src_tokens.to('cpu')
+            tgt_tokens = tgt_tokens.to('cpu')
+            attns = [i.to('cpu') for i in attns]
+
+        ret_src_tokens, ret_tgt_tokens, ret_attns = [], [], []
+        for i in range(bsz):
+            tgt_valid = ((tgt_tokens[i] != self.pad) & (tgt_tokens[i] != self.eos)).nonzero(as_tuple=False).squeeze(dim=-1)
+            src_valid = ((src_tokens[i] != self.pad) & (src_tokens[i] != self.eos)).nonzero(as_tuple=False).squeeze(dim=-1)
+            tmp_attn = attns[i]
+            tmp_attn = tmp_attn[src_valid]
+            tmp_attn = tmp_attn[:, tgt_valid]
+            ret_attns.append(tmp_attn)
+            ret_src_tokens.append(src_tokens[i][src_valid])
+            ret_tgt_tokens.append(tgt_tokens[i][tgt_valid])
+
+        # return finalized
+        return ret_src_tokens, ret_tgt_tokens, ret_attns
+
 
 class EnsembleModel(nn.Module):
     """A wrapper around an ensemble of models."""

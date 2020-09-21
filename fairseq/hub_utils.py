@@ -187,6 +187,102 @@ class GeneratorHubInterface(nn.Module):
                         ))
         return outputs
 
+    def cal_attention(self, src_sentences: List[str], tgt_sentences: List[str], verbose: bool = False, **kwargs) -> List[torch.Tensor]:
+        if isinstance(src_sentences, list):
+            assert isinstance(tgt_sentences, list) and len(src_sentences) == len(tgt_sentences)
+        else:
+            type(src_sentences) == type(tgt_sentences)
+        return self.att_sample(src_sentences, tgt_sentences, verbose, **kwargs)
+
+    def att_sample(self, src_sentences: List[str], tgt_sentences: List[str], verbose: bool = False, **kwargs) -> List[torch.Tensor]:
+        if isinstance(src_sentences, str):
+            return self.att_sample([src_sentences], [tgt_sentences], verbose=verbose, **kwargs)[0]
+        tokenized_src_sentences = [self.encode(sentence) for sentence in src_sentences]
+        tokenized_tgt_sentences = [self.encode(sentence) for sentence in tgt_sentences]
+        from fairseq.data.encoders.byte_utils import SPACE
+
+        batched_hypos = self.generate_attention(tokenized_src_sentences, tokenized_tgt_sentences, verbose, **kwargs)
+        subword_input = [self.string(src) for src in batched_hypos[0][0]]
+        subword_trans = [self.string(tgt) for tgt in batched_hypos[0][1]]
+        attns = batched_hypos[0][2][0]   # (n_src, n_tgt), Remove the first one, because of bos (not sure about this).
+
+        # print('debug: input:', len(subword_input[0].split(SPACE)), subword_input[0].split(SPACE))
+        # print('debug: target:', len(subword_trans[0].split(SPACE)), subword_trans[0].split(SPACE))
+        # print('debug: original_attns:', batched_hypos[0][2][0])
+        # print(batched_hypos[0][2][0].sum(dim=1))
+        # print('bpe:', self.bpe.__class__.__name__)
+
+        bpe_separator = '@@'    # From subword_nmt_bpe.py
+        cur_idx, prev_flag = 0, False
+        for i, subword in enumerate(subword_input[0].split(SPACE)):
+            # print(subword, bpe_separator in subword)
+            if prev_flag:
+                attns[cur_idx, :] += attns[i, :]
+            else:
+                attns[cur_idx, :] = attns[i, :]
+
+            if bpe_separator in subword:
+                prev_flag = True
+            else:
+                cur_idx += 1
+                prev_flag = False
+        attns = attns[:cur_idx, :]
+
+        cur_idx, prev_flag = 0, False
+        for i, subword in enumerate(subword_trans[0].split(SPACE)):
+            # print(subword, bpe_separator in subword)
+            if prev_flag:
+                attns[:, cur_idx] += attns[:, i]
+            else:
+                attns[:, cur_idx] = attns[:, i]
+
+            if bpe_separator in subword:
+                # print('bpe_separator in.')
+                prev_flag = True
+            else:
+                cur_idx += 1
+                prev_flag = False
+        attns = attns[:, :cur_idx]
+
+        attns /= attns.sum(dim = 1, keepdim=True)  # Re-normalize
+        # print(attns)
+
+        return [attns]
+
+    def aggregate_attention(self, attns: List[torch.Tensor]) -> torch.Tensor:
+        pass
+
+    def generate_attention(
+        self,
+        tokenized_src_sentences: List[torch.LongTensor],
+        tokenized_tgt_sentences: List[torch.LongTensor],
+        verbose: bool = False,
+        skip_invalid_size_inputs=False,
+        inference_step_args=None,
+        **kwargs
+    ) -> List[List[Dict[str, torch.Tensor]]]:
+        if torch.is_tensor(tokenized_src_sentences) and tokenized_src_sentences.dim() == 1:
+            return self.generate_attention(
+                tokenized_src_sentences.unsqueeze(0), tokenized_tgt_sentences.unsqueeze(0), verbose=verbose, **kwargs
+            )[0]
+
+        # build generator using current args as well as any kwargs
+        gen_args = copy.copy(self.args)
+        for k, v in kwargs.items():
+            setattr(gen_args, k, v)
+        generator = self.task.build_generator(self.models, gen_args)
+
+        inference_step_args = inference_step_args or {}
+        results = []
+        for batch in self._build_batches_with_targets(tokenized_src_sentences, tokenized_tgt_sentences, skip_invalid_size_inputs):
+            batch = utils.apply_to_sample(lambda t: t.to(self.device), batch)
+            attentions = self.task.forward_attention(
+                generator, self.models, batch, **inference_step_args
+            )
+            results.append(attentions)
+
+        return results
+
     def encode(self, sentence: str) -> torch.LongTensor:
         sentence = self.tokenize(sentence)
         sentence = self.apply_bpe(sentence)
@@ -229,6 +325,21 @@ class GeneratorHubInterface(nn.Module):
         lengths = torch.LongTensor([t.numel() for t in tokens])
         batch_iterator = self.task.get_batch_iterator(
             dataset=self.task.build_dataset_for_inference(tokens, lengths),
+            max_tokens=self.args.max_tokens,
+            max_sentences=self.args.max_sentences,
+            max_positions=self.max_positions,
+            ignore_invalid_inputs=skip_invalid_size_inputs,
+            disable_iterator_cache=True,
+        ).next_epoch_itr(shuffle=False)
+        return batch_iterator
+
+    def _build_batches_with_targets(
+        self, src_tokens: List[List[int]], tgt_tokens: List[List[int]], skip_invalid_size_inputs: bool
+    ) -> Iterator[Dict[str, Any]]:
+        src_lengths = torch.LongTensor([t.numel() for t in src_tokens])
+        tgt_lengths = torch.LongTensor([t.numel() for t in tgt_tokens])
+        batch_iterator = self.task.get_batch_iterator(
+            dataset=self.task.build_dataset_for_attention(src_tokens, src_lengths, tgt_tokens, tgt_lengths),
             max_tokens=self.args.max_tokens,
             max_sentences=self.args.max_sentences,
             max_positions=self.max_positions,

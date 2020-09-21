@@ -422,6 +422,10 @@ class FairseqTask(object):
         with torch.no_grad():
             return generator.generate(models, sample, prefix_tokens=prefix_tokens, constraints=constraints)
 
+    def forward_attention(self, generator, models, sample, prefix_tokens=None, constraints=None):
+        with torch.no_grad():
+            return generator.generate_attention(models, sample, prefix_tokens=prefix_tokens, constraints=constraints)
+
     def begin_epoch(self, epoch, model):
         """Hook function called before the start of each epoch."""
         pass
